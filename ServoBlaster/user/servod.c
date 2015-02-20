@@ -42,6 +42,8 @@
 #include <getopt.h>
 #include <math.h>
 
+#include "mailbox.h"
+
 #define DMY	255	// Used to represent an invalid P1 pin, or unmapped servo
 
 #define NUM_P1PINS	26
@@ -59,6 +61,7 @@
 
 #define DEVFILE			"/dev/servoblaster"
 #define CFGFILE			"/dev/servoblaster-cfg"
+#define MBFILE			DEVICE_FILE_NAME	/* From mailbox.h */
 
 #define PAGE_SIZE		4096
 #define PAGE_SHIFT		12
@@ -68,16 +71,26 @@
 #define DMA_CHAN_MAX		14
 #define DMA_CHAN_DEFAULT	14
 
-#define DMA_BASE		0x20007000
+#define DMA_BASE_OFFSET		0x00007000
 #define DMA_LEN			DMA_CHAN_SIZE * (DMA_CHAN_MAX+1)
-#define PWM_BASE		0x2020C000
+#define PWM_BASE_OFFSET		0x0020C000
 #define PWM_LEN			0x28
-#define CLK_BASE	        0x20101000
+#define CLK_BASE_OFFSET	        0x00101000
 #define CLK_LEN			0xA8
-#define GPIO_BASE		0x20200000
+#define GPIO_BASE_OFFSET	0x00200000
 #define GPIO_LEN		0x100
-#define PCM_BASE		0x20203000
+#define PCM_BASE_OFFSET		0x00203000
 #define PCM_LEN			0x24
+
+#define DMA_VIRT_BASE		(periph_virt_base + DMA_BASE_OFFSET)
+#define PWM_VIRT_BASE		(periph_virt_base + PWM_BASE_OFFSET)
+#define CLK_VIRT_BASE		(periph_virt_base + CLK_BASE_OFFSET)
+#define GPIO_VIRT_BASE		(periph_virt_base + GPIO_BASE_OFFSET)
+#define PCM_VIRT_BASE		(periph_virt_base + PCM_BASE_OFFSET)
+
+#define PWM_PHYS_BASE		(periph_phys_base + PWM_BASE_OFFSET)
+#define PCM_PHYS_BASE		(periph_phys_base + PCM_BASE_OFFSET)
+#define GPIO_PHYS_BASE		(periph_phys_base + GPIO_BASE_OFFSET)
 
 #define DMA_NO_WIDE_BURSTS	(1<<26)
 #define DMA_WAIT_RESP		(1<<3)
@@ -140,9 +153,7 @@ typedef struct {
 		 stride, next, pad[2];
 } dma_cb_t;
 
-typedef struct {
-	uint32_t physaddr;
-} page_map_t;
+#define BUS_TO_PHYS(x) ((x)&~0xC0000000)
 
 /* Define which P1 header pins to use by default.  These are the eight standard
  * GPIO pins (those coloured green in the diagram on this page:
@@ -255,11 +266,6 @@ static int num_servos;
 static uint32_t gpiomode[MAX_SERVOS];
 static int restore_gpio_modes;
 
-page_map_t *page_map;
-
-static uint8_t *virtbase;
-static uint8_t *virtcached;
-
 static volatile uint32_t *pwm_reg;
 static volatile uint32_t *pcm_reg;
 static volatile uint32_t *clk_reg;
@@ -282,6 +288,21 @@ static uint32_t *turnoff_mask;
 static uint32_t *turnon_mask;
 static dma_cb_t *cb_base;
 
+static int board_model;
+static int board_revision;
+
+static uint32_t periph_phys_base;
+static uint32_t periph_virt_base;
+static uint32_t dram_phys_base;
+static uint32_t mem_flag;
+
+static struct {
+	int handle;		/* From mbox_open() */
+	unsigned mem_ref;	/* From mem_alloc() */
+	unsigned bus_addr;	/* From mem_lock() */
+	uint8_t *virt_addr;	/* From mapmem() */
+} mbox;
+	
 static void set_servo(int servo, int width);
 static void set_servo_idle(int servo);
 static void gpio_set_mode(uint32_t gpio, uint32_t mode);
@@ -300,7 +321,7 @@ terminate(int dummy)
 {
 	int i;
 
-	if (dma_reg && virtbase) {
+	if (dma_reg && mbox.virt_addr) {
 		for (i = 0; i < MAX_SERVOS; i++) {
 			if (servo2gpio[i] != DMY)
 				set_servo(i, 0);
@@ -315,6 +336,12 @@ terminate(int dummy)
 				gpio_set_mode(servo2gpio[i], gpiomode[i]);
 		}
 	}
+	if (mbox.virt_addr != NULL) {
+		unmapmem(mbox.virt_addr, num_pages * 4096);
+		mem_unlock(mbox.handle, mbox.mem_ref);
+		mem_free(mbox.handle, mbox.mem_ref);
+	}
+
 	unlink(DEVFILE);
 	unlink(CFGFILE);
 	exit(1);
@@ -413,15 +440,15 @@ gpio_set(int gpio, int level)
 static uint32_t
 mem_virt_to_phys(void *virt)
 {
-	uint32_t offset = (uint8_t *)virt - virtbase;
+	uint32_t offset = (uint8_t *)virt - mbox.virt_addr;
 
-	return page_map[offset >> PAGE_SHIFT].physaddr + (offset % PAGE_SIZE);
+	return mbox.bus_addr + offset;
 }
 
 static void *
 map_peripheral(uint32_t base, uint32_t len)
 {
-	int fd = open("/dev/mem", O_RDWR);
+	int fd = open("/dev/mem", O_RDWR|O_SYNC);
 	void * vaddr;
 
 	if (fd < 0)
@@ -501,47 +528,6 @@ set_servo(int servo, int width)
 }
 
 static void
-make_pagemap(void)
-{
-	int i, fd, memfd, pid;
-	char pagemap_fn[64];
-
-	page_map = malloc(num_pages * sizeof(*page_map));
-	if (page_map == 0)
-		fatal("servod: Failed to malloc page_map: %m\n");
-	memfd = open("/dev/mem", O_RDWR);
-	if (memfd < 0)
-		fatal("servod: Failed to open /dev/mem: %m\n");
-	pid = getpid();
-	sprintf(pagemap_fn, "/proc/%d/pagemap", pid);
-	fd = open(pagemap_fn, O_RDONLY);
-	if (fd < 0)
-		fatal("servod: Failed to open %s: %m\n", pagemap_fn);
-	if (lseek(fd, (uint32_t)(size_t)virtcached >> 9, SEEK_SET) !=
-						(uint32_t)(size_t)virtcached >> 9) {
-		fatal("servod: Failed to seek on %s: %m\n", pagemap_fn);
-	}
-	for (i = 0; i < num_pages; i++) {
-		uint64_t pfn;
-		if (read(fd, &pfn, sizeof(pfn)) != sizeof(pfn))
-			fatal("servod: Failed to read %s: %m\n", pagemap_fn);
-		if (((pfn >> 55) & 0x1bf) != 0x10c)
-			fatal("servod: Page %d not present (pfn 0x%016llx)\n", i, pfn);
-		page_map[i].physaddr = (uint32_t)pfn << PAGE_SHIFT | 0x40000000;
-		if (mmap(virtbase + i * PAGE_SIZE, PAGE_SIZE, PROT_READ|PROT_WRITE,
-			MAP_SHARED|MAP_FIXED|MAP_LOCKED|MAP_NORESERVE,
-			memfd, (uint32_t)pfn << PAGE_SHIFT | 0x40000000) !=
-				virtbase + i * PAGE_SIZE) {
-			fatal("Failed to create uncached map of page %d at %p\n",
-				i,  virtbase + i * PAGE_SIZE);
-		}
-	}
-	close(fd);
-	close(memfd);
-	memset(virtbase, 0, num_pages * PAGE_SIZE);
-}
-
-static void
 setup_sighandlers(void)
 {
 	int i;
@@ -568,18 +554,18 @@ init_ctrl_data(void)
 	uint32_t maskall = 0;
 
 	if (invert) {
-		phys_gpclr0 = 0x7e200000 + 0x1c;
-		phys_gpset0 = 0x7e200000 + 0x28;
+		phys_gpclr0 = GPIO_PHYS_BASE + 0x1c;
+		phys_gpset0 = GPIO_PHYS_BASE + 0x28;
 	} else {
-		phys_gpclr0 = 0x7e200000 + 0x28;
-		phys_gpset0 = 0x7e200000 + 0x1c;
+		phys_gpclr0 = GPIO_PHYS_BASE + 0x28;
+		phys_gpset0 = GPIO_PHYS_BASE + 0x1c;
 	}
 
 	if (delay_hw == DELAY_VIA_PWM) {
-		phys_fifo_addr = (PWM_BASE | 0x7e000000) + 0x18;
+		phys_fifo_addr = PWM_PHYS_BASE + 0x18;
 		cbinfo = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP | DMA_D_DREQ | DMA_PER_MAP(5);
 	} else {
-		phys_fifo_addr = (PCM_BASE | 0x7e000000) + 0x04;
+		phys_fifo_addr = PCM_PHYS_BASE + 0x04;
 		cbinfo = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP | DMA_D_DREQ | DMA_PER_MAP(2);
 	}
 
@@ -849,17 +835,16 @@ go_go_go(void)
  * (see comments in wiringPi for details).  We will just look at the last two
  * digits of the Revision string and treat '00' and '01' as errors, '02' and
  * '03' as rev 1, and any other hex value as rev 2.
+ * TODO: This is wrong.  Fix in line with current WiringPi.
  */
-static int
-board_rev(void)
+static void
+get_model_and_revision(void)
 {
-	char buf[128];
+	char buf[128], revstr[128], modelstr[128];
 	char *ptr, *end, *res;
-	static int rev = 0;
 	FILE *fp;
 
-	if (rev)
-		return rev;
+	revstr[0] = modelstr[0] = '\0';
 
 	fp = fopen("/proc/cpuinfo", "r");
 
@@ -867,26 +852,47 @@ board_rev(void)
 		fatal("Unable to open /proc/cpuinfo: %m\n");
 
 	while ((res = fgets(buf, 128, fp))) {
-		if (!strncmp(buf, "Revision", 8))
-			break;
+		if (!strncasecmp("model name", buf, 8))
+			memcpy(modelstr, buf, 128);
+		else if (!strncasecmp(buf, "revision", 8))
+			memcpy(revstr, buf, 128);
 	}
 	fclose(fp);
 
-	if (!res)
+	if (modelstr[0] == '\0')
+		fatal("servod: No 'Model name' record in /proc/cpuinfo\n");
+	if (revstr[0] == '\0')
 		fatal("servod: No 'Revision' record in /proc/cpuinfo\n");
 
-	ptr = buf + strlen(buf) - 3;
-	rev = strtol(ptr, &end, 16);
+	if (strstr(modelstr, "ARMv6"))
+		board_model = 1;
+	else if (strstr(modelstr, "ARMv7"))
+		board_model = 2;
+	else
+		fatal("servod: Cannot parse the model name string\n");
+
+	ptr = revstr + strlen(revstr) - 3;
+	board_revision = strtol(ptr, &end, 16);
 	if (end != ptr + 2)
 		fatal("servod: Failed to parse Revision string\n");
-	if (rev < 1)
+	if (board_revision < 1)
 		fatal("servod: Invalid board Revision\n");
-	else if (rev < 4)
-		rev = 1;
+	else if (board_revision < 4)
+		board_revision = 1;
 	else
-		rev = 2;
+		board_revision = 2;
 
-	return rev;
+	if (board_model == 1) {
+		periph_virt_base = 0x20000000;
+		periph_phys_base = 0x7e000000;
+		dram_phys_base   = 0x40000000;
+		mem_flag         = 0x0c;
+	} else {
+		periph_virt_base = 0x3f000000;
+		periph_phys_base = 0x7e000000;
+		dram_phys_base   = 0xc0000000;
+		mem_flag         = 0x04;
+	}
 }
 
 static void
@@ -905,7 +911,7 @@ parse_pin_lists(int p1first, char *p1pins, char*p5pins)
 		if (lst == 0 && p1first) {
 			name = "P1";
 			pins = p1pins;
-			if (board_rev() == 1) {
+			if (board_model == 1 && board_revision == 1) {
 				map = rev1_p1pin2gpio_map;
 				mapcnt = sizeof(rev1_p1pin2gpio_map);
 			} else {
@@ -916,7 +922,7 @@ parse_pin_lists(int p1first, char *p1pins, char*p5pins)
 		} else {
 			name = "P5";
 			pins = p5pins;
-			if (board_rev() == 1) {
+			if (board_model == 1 && board_revision == 1) {
 				map = rev1_p5pin2gpio_map;
 				mapcnt = sizeof(rev1_p5pin2gpio_map);
 			} else {
@@ -982,7 +988,7 @@ gpio2pinname(uint8_t gpio)
 	static char res[16];
 	uint8_t pin;
 
-	if (board_rev() == 1) {
+	if (board_model == 1 && board_revision == 1) {
 		if ((pin = gpiosearch(gpio, rev1_p1pin2gpio_map, sizeof(rev1_p1pin2gpio_map))))
 			sprintf(res, "P1-%d", pin);
 		else if ((pin = gpiosearch(gpio, rev1_p5pin2gpio_map, sizeof(rev1_p5pin2gpio_map))))
@@ -1151,8 +1157,9 @@ main(int argc, char **argv)
 			fatal("Invalid parameter\n");
 		}
 	}
-	if (board_rev() == 1 && p5pins[0])
-		fatal("Board rev 1 does not have a P5 header\n");
+	get_model_and_revision();
+	if (board_model == 1 && board_revision == 1 && p5pins[0])
+		fatal("Board model 1 revision 1 does not have a P5 header\n");
 
 	parse_pin_lists(p1first, p1pins, p5pins);
 
@@ -1232,7 +1239,8 @@ main(int argc, char **argv)
 		fatal("min value is >= max value\n");
 	}
 
-	printf("\nBoard revision:            %7d\n", board_rev());
+	printf("\nBoard model:               %7d\n", board_model);
+	printf("Board revision:            %7d\n", board_revision);
 	printf("Using hardware:                %s\n", delay_hw == DELAY_VIA_PWM ? "PWM" : "PCM");
 	printf("Using DMA channel:         %7d\n", dma_chan);
 	if (idle_timeout)
@@ -1248,7 +1256,7 @@ main(int argc, char **argv)
 						servo_max_ticks * step_time_us);
 	printf("Output levels:            %s\n", invert ? "Inverted" : "  Normal");
 	printf("\nUsing P1 pins:               %s\n", p1pins);
-	if (board_rev() > 1)
+	if (board_model > 1 || board_revision > 1)
 		printf("Using P5 pins:               %s\n", p5pins);
 	printf("\nServo mapping:\n");
 	for (i = 0; i < MAX_SERVOS; i++) {
@@ -1261,55 +1269,31 @@ main(int argc, char **argv)
 	init_idle_timers();
 	setup_sighandlers();
 
-	dma_reg = map_peripheral(DMA_BASE, DMA_LEN);
+	dma_reg = map_peripheral(DMA_VIRT_BASE, DMA_LEN);
 	dma_reg += dma_chan * DMA_CHAN_SIZE / sizeof(uint32_t);
-	pwm_reg = map_peripheral(PWM_BASE, PWM_LEN);
-	pcm_reg = map_peripheral(PCM_BASE, PCM_LEN);
-	clk_reg = map_peripheral(CLK_BASE, CLK_LEN);
-	gpio_reg = map_peripheral(GPIO_BASE, GPIO_LEN);
+	pwm_reg = map_peripheral(PWM_VIRT_BASE, PWM_LEN);
+	pcm_reg = map_peripheral(PCM_VIRT_BASE, PCM_LEN);
+	clk_reg = map_peripheral(CLK_VIRT_BASE, CLK_LEN);
+	gpio_reg = map_peripheral(GPIO_VIRT_BASE, GPIO_LEN);
 
-	/*
-	 * Map the pages to our virtual address space; this reserves them and
-	 * locks them in memory.  However, these are L1 & L2 non-coherent
-	 * cached pages and we want coherent access to them so the DMA
-	 * controller sees our changes immediately.  To get that, we create a
-	 * second mapping of the same size and immediately free it.  This gives
-	 * us an address in our virtual address space where we can map in a
-	 * coherent view of the physical pages that were allocated by the first
-	 * mmap(). This coherent mapping happens in make_pagemap().  All
-	 * accesses to our memory that is shared with the DMA controller are
-	 * via this second coherent mapping.  The memset() below forces the
-	 * pages to be allocated.
-	 */
-	virtcached = mmap(NULL, num_pages * PAGE_SIZE, PROT_READ|PROT_WRITE,
-			MAP_SHARED|MAP_ANONYMOUS|MAP_NORESERVE|MAP_LOCKED,
-			-1, 0);
-	if (virtcached == MAP_FAILED)
-		fatal("servod: Failed to mmap for cached pages: %m\n");
-	if ((unsigned long)virtcached & (PAGE_SIZE-1))
-		fatal("servod: Virtual address is not page aligned\n");
-	memset(virtcached, 0, num_pages * PAGE_SIZE);
+	/* Use the mailbox interface to the VC to ask for physical memory */
+	unlink(MBFILE);
+	if (mknod(MBFILE, S_IFCHR|0600, makedev(100, 0)) < 0)
+		fatal("Failed to create mailbox device\n");
+	mbox.handle = mbox_open();
+	if (mbox.handle < 0)
+		fatal("Failed to open mailbox\n");
+	mbox.mem_ref = mem_alloc(mbox.handle, num_pages * 4096, 4096, mem_flag);
+	/* TODO: How do we know that succeeded? */
+	printf("mem_ref %u\n", mbox.mem_ref);
+	mbox.bus_addr = mem_lock(mbox.handle, mbox.mem_ref);
+	printf("bus_addr = %u\n", mbox.bus_addr);
+	mbox.virt_addr = mapmem(BUS_TO_PHYS(mbox.bus_addr), num_pages * 4096);
+	printf("virt_addr %p\n", mbox.virt_addr);
 
-	virtbase = mmap(NULL, num_pages * PAGE_SIZE, PROT_READ|PROT_WRITE,
-			MAP_SHARED|MAP_ANONYMOUS|MAP_NORESERVE|MAP_LOCKED,
-			-1, 0);
-	if (virtbase == MAP_FAILED)
-		fatal("servod: Failed to mmap uncached pages: %m\n");
-	if ((unsigned long)virtbase & (PAGE_SIZE-1))
-		fatal("servod: Virtual address is not page aligned\n");
-	munmap(virtbase, num_pages * PAGE_SIZE);
-
-	make_pagemap();
-
-	/*
-	 * Now the memory is all mapped, we can set up the pointers to the
-	 * bit masks used to turn outputs on and off, and to the DMA control
-	 * blocks.  The control blocks must be 32 byte aligned (so round up
-	 * to multiple of 8, as we're then multiplying by 4).
-	 */
-	turnoff_mask = (uint32_t *)virtbase;
-	turnon_mask = (uint32_t *)(virtbase + num_samples * sizeof(uint32_t));
-	cb_base = (dma_cb_t *)(virtbase +
+	turnoff_mask = (uint32_t *)mbox.virt_addr;
+	turnon_mask = (uint32_t *)(mbox.virt_addr + num_samples * sizeof(uint32_t));
+	cb_base = (dma_cb_t *)(mbox.virt_addr +
 		ROUNDUP(num_samples + MAX_SERVOS, 8) * sizeof(uint32_t));
 
 	for (i = 0; i < MAX_SERVOS; i++) {
