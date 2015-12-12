@@ -46,7 +46,7 @@
 
 #define DMY	255	// Used to represent an invalid P1 pin, or unmapped servo
 
-#define NUM_P1PINS	26
+#define NUM_P1PINS	40
 #define NUM_P5PINS	8
 
 #define MAX_SERVOS	32	/* Only 21 really, but this lets you map servo IDs
@@ -61,7 +61,6 @@
 
 #define DEVFILE			"/dev/servoblaster"
 #define CFGFILE			"/dev/servoblaster-cfg"
-#define MBFILE			DEVICE_FILE_NAME	/* From mailbox.h */
 
 #define PAGE_SIZE		4096
 #define PAGE_SHIFT		12
@@ -102,6 +101,7 @@
 
 #define DMA_CS			(0x00/4)
 #define DMA_CONBLK_AD		(0x04/4)
+#define DMA_SOURCE_AD		(0x0c/4)
 #define DMA_DEBUG		(0x20/4)
 
 #define GPIO_FSEL0		(0x00/4)
@@ -246,6 +246,49 @@ static uint8_t rev2_p5pin2gpio_map[] = {
 	DMY,	// P5-8   Ground
 };
 
+static uint8_t bplus_p1pin2gpio_map[] = {
+	DMY,	// P1-1   3v3
+	DMY,	// P1-2   5v
+	2,	// P1-3   GPIO 2 (SDA)
+	DMY,	// P1-4   5v
+	3,	// P1-5   GPIO 3 (SCL)
+	DMY,	// P1-6   Ground
+	4,	// P1-7   GPIO 4 (GPCLK0)
+	14,	// P1-8   GPIO 14 (TXD)
+	DMY,	// P1-9   Ground
+	15,	// P1-10  GPIO 15 (RXD)
+	17,	// P1-11  GPIO 17
+	18,	// P1-12  GPIO 18 (PCM_CLK)
+	27,	// P1-13  GPIO 27
+	DMY,	// P1-14  Ground
+	22,	// P1-15  GPIO 22
+	23,	// P1-16  GPIO 23
+	DMY,	// P1-17  3v3
+	24,	// P1-18  GPIO 24
+	10,	// P1-19  GPIO 10 (MOSI)
+	DMY,	// P1-20  Ground
+	9,	// P1-21  GPIO 9 (MISO)
+	25,	// P1-22  GPIO 25
+	11,	// P1-23  GPIO 11 (SCLK)
+	8,	// P1-24  GPIO 8 (CE0)
+	DMY,	// P1-25  Ground
+	7,	// P1-26  GPIO 7 (CE1)
+	DMY,	// P1-27  ID_SD
+	DMY,	// P1-28  ID_SC
+	5,	// P1-29  GPIO 5
+	DMY,	// P1-30  Ground
+	6,	// P1-31  GPIO 5
+	12,	// P1-32  GPIO 12
+	13,	// P1-33  GPIO 13
+	DMY,	// P1-34  Ground
+	19,	// P1-35  GPIO 19
+	16,	// P1-36  GPIO 16
+	26,	// P1-37  GPIO 26
+	20,	// P1-38  GPIO 20
+	DMY,	// P1-39  Ground
+	21,	// P1-40  GPIO 21
+};
+
 // cycle_time_us is the pulse cycle time per servo, in microseconds.
 // Typically it should be 20ms, or 20000us.
 
@@ -289,15 +332,23 @@ static uint32_t *turnon_mask;
 static dma_cb_t *cb_base;
 
 static int board_model;
-static int board_revision;
+static int gpio_cfg;
 
 static uint32_t periph_phys_base;
 static uint32_t periph_virt_base;
 static uint32_t dram_phys_base;
 static uint32_t mem_flag;
 
+static char *gpio_desc[] = {
+	"Unknown",
+	"P1 (26 pins)",
+	"P1 (26 pins), P5 (8 pins)",
+	"P1 (40 pins)"
+};
+
 static struct {
 	int handle;		/* From mbox_open() */
+	uint32_t size;		/* Required size */
 	unsigned mem_ref;	/* From mem_alloc() */
 	unsigned bus_addr;	/* From mem_lock() */
 	uint8_t *virt_addr;	/* From mapmem() */
@@ -337,9 +388,11 @@ terminate(int dummy)
 		}
 	}
 	if (mbox.virt_addr != NULL) {
-		unmapmem(mbox.virt_addr, num_pages * 4096);
+		unmapmem(mbox.virt_addr, mbox.size);
 		mem_unlock(mbox.handle, mbox.mem_ref);
 		mem_free(mbox.handle, mbox.mem_ref);
+		if (mbox.handle >= 0)
+			mbox_close(mbox.handle);
 	}
 
 	unlink(DEVFILE);
@@ -683,11 +736,45 @@ init_hardware(void)
 }
 
 static void
+do_status(char *filename)
+{
+	uint32_t last;
+	int status = -1;
+	char *p;
+	int fd;
+	const char *dma_dead = "ERROR: DMA not running\n";
+
+	while (*filename == ' ')
+		filename++;
+	p = filename + strlen(filename) - 1;
+	while (p > filename && (*p == '\n' || *p == '\r' || *p == ' '))
+		*p-- = '\0';
+
+	last = dma_reg[DMA_CONBLK_AD];
+	udelay(step_time_us*2);
+	if (dma_reg[DMA_CONBLK_AD] != last)
+		status = 0;
+	if ((fd = open(filename, O_WRONLY|O_CREAT, 0666)) >= 0) {
+		if (status == 0)
+			write(fd, "OK\n", 3);
+		else
+			write(fd, dma_dead, strlen(dma_dead));
+		close(fd);
+	} else {
+		printf("Failed to open %s for writing: %m\n", filename);
+	}
+}
+
+static void
 do_debug(void)
 {
 	int i;
 	uint32_t mask = 0;
-	uint32_t last = 0xffffffff;
+	uint32_t last;
+
+	last = dma_reg[DMA_CONBLK_AD];
+	udelay(step_time_us*2);
+	printf("%08x %08x\n", last, dma_reg[DMA_CONBLK_AD]);
 
 	printf("---------------------------\n");
 	printf("Servo  Start  Width  TurnOn\n");
@@ -699,6 +786,7 @@ do_debug(void)
 		}
 	}
 	printf("\nData:\n");
+	last = 0xffffffff;
 	for (i = 0; i < num_samples; i++) {
 		uint32_t curr = turnoff_mask[i] & mask;
 		if (curr != last)
@@ -809,6 +897,8 @@ go_go_go(void)
 					n = sscanf(line, "%d=%s", &servo, width_arg);
 					if (!strcmp(line, "debug\n")) {
 						do_debug();
+					} else if (!strncmp(line, "status ", 7)) {
+						do_status(line + 7);
 					} else if (n != 2) {
 						fprintf(stderr, "Bad input: %s", line);
 					} else if (servo < 0 || servo >= MAX_SERVOS) {
@@ -834,14 +924,15 @@ go_go_go(void)
 /* Determining the board revision is a lot more complicated than it should be
  * (see comments in wiringPi for details).  We will just look at the last two
  * digits of the Revision string and treat '00' and '01' as errors, '02' and
- * '03' as rev 1, and any other hex value as rev 2.
- * TODO: This is wrong.  Fix in line with current WiringPi.
+ * '03' as rev 1, and any other hex value as rev 2.  'Pi1 and Pi2 are
+ * differentiated by the Hardware being BCM2708 or BCM2709.
  */
 static void
 get_model_and_revision(void)
 {
 	char buf[128], revstr[128], modelstr[128];
 	char *ptr, *end, *res;
+	int board_revision;
 	FILE *fp;
 
 	revstr[0] = modelstr[0] = '\0';
@@ -852,7 +943,7 @@ get_model_and_revision(void)
 		fatal("Unable to open /proc/cpuinfo: %m\n");
 
 	while ((res = fgets(buf, 128, fp))) {
-		if (!strncasecmp("model name", buf, 8))
+		if (!strncasecmp("hardware", buf, 8))
 			memcpy(modelstr, buf, 128);
 		else if (!strncasecmp(buf, "revision", 8))
 			memcpy(revstr, buf, 128);
@@ -860,16 +951,16 @@ get_model_and_revision(void)
 	fclose(fp);
 
 	if (modelstr[0] == '\0')
-		fatal("servod: No 'Model name' record in /proc/cpuinfo\n");
+		fatal("servod: No 'Hardware' record in /proc/cpuinfo\n");
 	if (revstr[0] == '\0')
 		fatal("servod: No 'Revision' record in /proc/cpuinfo\n");
 
-	if (strstr(modelstr, "ARMv6"))
+	if (strstr(modelstr, "BCM2708"))
 		board_model = 1;
-	else if (strstr(modelstr, "ARMv7"))
+	else if (strstr(modelstr, "BCM2709"))
 		board_model = 2;
 	else
-		fatal("servod: Cannot parse the model name string\n");
+		fatal("servod: Cannot parse the hardware name string\n");
 
 	ptr = revstr + strlen(revstr) - 3;
 	board_revision = strtol(ptr, &end, 16);
@@ -878,9 +969,11 @@ get_model_and_revision(void)
 	if (board_revision < 1)
 		fatal("servod: Invalid board Revision\n");
 	else if (board_revision < 4)
-		board_revision = 1;
+		gpio_cfg = 1;
+	else if (board_revision < 16)
+		gpio_cfg = 2;
 	else
-		board_revision = 2;
+		gpio_cfg = 3;
 
 	if (board_model == 1) {
 		periph_virt_base = 0x20000000;
@@ -911,23 +1004,29 @@ parse_pin_lists(int p1first, char *p1pins, char*p5pins)
 		if (lst == 0 && p1first) {
 			name = "P1";
 			pins = p1pins;
-			if (board_model == 1 && board_revision == 1) {
+			if (board_model == 1 && gpio_cfg == 1) {
 				map = rev1_p1pin2gpio_map;
 				mapcnt = sizeof(rev1_p1pin2gpio_map);
-			} else {
+			} else if (board_model == 1 && gpio_cfg == 2) {
 				map = rev2_p1pin2gpio_map;
 				mapcnt = sizeof(rev2_p1pin2gpio_map);
+			} else {
+				map = bplus_p1pin2gpio_map;
+				mapcnt = sizeof(bplus_p1pin2gpio_map);
 			}
 			pNpin2servo = p1pin2servo;
 		} else {
 			name = "P5";
 			pins = p5pins;
-			if (board_model == 1 && board_revision == 1) {
+			if (board_model == 1 && gpio_cfg == 1) {
 				map = rev1_p5pin2gpio_map;
 				mapcnt = sizeof(rev1_p5pin2gpio_map);
-			} else {
+			} else if (board_model == 1 && gpio_cfg == 2) {
 				map = rev2_p5pin2gpio_map;
 				mapcnt = sizeof(rev2_p5pin2gpio_map);
+			} else {
+				map = NULL;
+				mapcnt = 0;
 			}
 			pNpin2servo = p5pin2servo;
 		}
@@ -988,18 +1087,23 @@ gpio2pinname(uint8_t gpio)
 	static char res[16];
 	uint8_t pin;
 
-	if (board_model == 1 && board_revision == 1) {
+	if (board_model == 1 && gpio_cfg == 1) {
 		if ((pin = gpiosearch(gpio, rev1_p1pin2gpio_map, sizeof(rev1_p1pin2gpio_map))))
 			sprintf(res, "P1-%d", pin);
 		else if ((pin = gpiosearch(gpio, rev1_p5pin2gpio_map, sizeof(rev1_p5pin2gpio_map))))
 			sprintf(res, "P5-%d", pin);
 		else
 			fatal("Cannot map GPIO %d to a header pin\n", gpio);
-	} else {
+	} else if (board_model == 1 && gpio_cfg == 2) {
 		if ((pin = gpiosearch(gpio, rev2_p1pin2gpio_map, sizeof(rev2_p1pin2gpio_map))))
 			sprintf(res, "P1-%d", pin);
 		else if ((pin = gpiosearch(gpio, rev2_p5pin2gpio_map, sizeof(rev2_p5pin2gpio_map))))
 			sprintf(res, "P5-%d", pin);
+		else
+			fatal("Cannot map GPIO %d to a header pin\n", gpio);
+	} else {
+		if ((pin = gpiosearch(gpio, bplus_p1pin2gpio_map, sizeof(bplus_p1pin2gpio_map))))
+			sprintf(res, "P1-%d", pin);
 		else
 			fatal("Cannot map GPIO %d to a header pin\n", gpio);
 	}
@@ -1158,7 +1262,7 @@ main(int argc, char **argv)
 		}
 	}
 	get_model_and_revision();
-	if (board_model == 1 && board_revision == 1 && p5pins[0])
+	if (board_model == 1 && gpio_cfg == 1 && p5pins[0])
 		fatal("Board model 1 revision 1 does not have a P5 header\n");
 
 	parse_pin_lists(p1first, p1pins, p5pins);
@@ -1240,7 +1344,7 @@ main(int argc, char **argv)
 	}
 
 	printf("\nBoard model:               %7d\n", board_model);
-	printf("Board revision:            %7d\n", board_revision);
+	printf("GPIO configuration:            %s\n", gpio_desc[gpio_cfg]);
 	printf("Using hardware:                %s\n", delay_hw == DELAY_VIA_PWM ? "PWM" : "PCM");
 	printf("Using DMA channel:         %7d\n", dma_chan);
 	if (idle_timeout)
@@ -1256,7 +1360,7 @@ main(int argc, char **argv)
 						servo_max_ticks * step_time_us);
 	printf("Output levels:            %s\n", invert ? "Inverted" : "  Normal");
 	printf("\nUsing P1 pins:               %s\n", p1pins);
-	if (board_model > 1 || board_revision > 1)
+	if (board_model == 1 && gpio_cfg == 2)
 		printf("Using P5 pins:               %s\n", p5pins);
 	printf("\nServo mapping:\n");
 	for (i = 0; i < MAX_SERVOS; i++) {
@@ -1277,19 +1381,21 @@ main(int argc, char **argv)
 	gpio_reg = map_peripheral(GPIO_VIRT_BASE, GPIO_LEN);
 
 	/* Use the mailbox interface to the VC to ask for physical memory */
-	unlink(MBFILE);
-	if (mknod(MBFILE, S_IFCHR|0600, makedev(100, 0)) < 0)
-		fatal("Failed to create mailbox device\n");
-	mbox.handle = mbox_open();
-	if (mbox.handle < 0)
-		fatal("Failed to open mailbox\n");
-	mbox.mem_ref = mem_alloc(mbox.handle, num_pages * 4096, 4096, mem_flag);
-	/* TODO: How do we know that succeeded? */
-	printf("mem_ref %u\n", mbox.mem_ref);
+	// Use the mailbox interface to request memory from the VideoCore
+	// We specifiy (-1) for the handle rather than calling mbox_open()
+	// so multiple users can share the resource.
+	mbox.handle = -1; // mbox_open();
+	mbox.size = num_pages * 4096;
+	mbox.mem_ref = mem_alloc(mbox.handle, mbox.size, 4096, mem_flag);
+	if (mbox.mem_ref < 0) {
+		fatal("Failed to alloc memory from VideoCore\n");
+	}
 	mbox.bus_addr = mem_lock(mbox.handle, mbox.mem_ref);
-	printf("bus_addr = %u\n", mbox.bus_addr);
-	mbox.virt_addr = mapmem(BUS_TO_PHYS(mbox.bus_addr), num_pages * 4096);
-	printf("virt_addr %p\n", mbox.virt_addr);
+	if (mbox.bus_addr == ~0) {
+		mem_free(mbox.handle, mbox.size);
+		fatal("Failed to lock memory\n");
+	}
+	mbox.virt_addr = mapmem(BUS_TO_PHYS(mbox.bus_addr), mbox.size);
 
 	turnoff_mask = (uint32_t *)mbox.virt_addr;
 	turnon_mask = (uint32_t *)(mbox.virt_addr + num_samples * sizeof(uint32_t));
